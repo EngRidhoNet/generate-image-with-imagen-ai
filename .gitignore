@@ -1,0 +1,5 @@
+build
+__pychache__
+upscale.egg-info
+install_upscale.sh
+venv
