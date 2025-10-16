@@ -1,203 +1,220 @@
 import os
 import sys
 import argparse
-import tempfile
 from pathlib import Path
-from PIL import Image, ImageOps
+from PIL import Image, ImageFilter
 from tqdm import tqdm
 
-import torch
-from realesrgan import RealESRGAN
-
-# --- Util ---
-VALID_EXT = {".jpg", ".jpeg", ".png", ".webp"}
+VALID_EXT = {".jpg", ".jpeg", ".png", ".webp", ".bmp", ".tiff"}
 
 def list_images(root: Path):
+    """Find all image files in directory"""
     for p in root.rglob("*"):
         if p.suffix.lower() in VALID_EXT and p.is_file():
             yield p
 
-def ensure_rgb(pil_img: Image.Image) -> Image.Image:
-    # Normalisasi warna agar tidak "terdeteksi CMYK" di platform stok
-    if pil_img.mode not in ("RGB", "RGBA"):
-        pil_img = pil_img.convert("RGB")
-    # Hilangkan profil ICC yang bikin ribet kompatibilitas
-    pil_img.info.pop("icc_profile", None)
-    return pil_img
+def upscale_image_pil(input_path: Path, output_path: Path, scale: int, method="lanczos"):
+    """Upscale image using PIL with high-quality resampling"""
+    try:
+        with Image.open(input_path) as img:
+            # Convert to RGB if needed (for compatibility)
+            if img.mode not in ['RGB', 'RGBA']:
+                if img.mode == 'P' and 'transparency' in img.info:
+                    img = img.convert('RGBA')
+                else:
+                    img = img.convert('RGB')
+            
+            # Get original size
+            width, height = img.size
+            new_width = width * scale
+            new_height = height * scale
+            
+            # Choose resampling method
+            if method == "lanczos":
+                resample = Image.LANCZOS
+            elif method == "bicubic":
+                resample = Image.BICUBIC
+            elif method == "nearest":
+                resample = Image.NEAREST
+            else:
+                resample = Image.LANCZOS
+            
+            # Upscale
+            upscaled = img.resize((new_width, new_height), resample)
+            
+            # Apply slight sharpening for better quality
+            if method == "lanczos":
+                upscaled = upscaled.filter(ImageFilter.UnsharpMask(radius=0.5, percent=50, threshold=0))
+            
+            # Ensure output directory exists
+            output_path.parent.mkdir(parents=True, exist_ok=True)
+            
+            # Save with high quality
+            if output_path.suffix.lower() in ['.jpg', '.jpeg']:
+                upscaled.save(output_path, 'JPEG', quality=95, optimize=True)
+            else:
+                upscaled.save(output_path, optimize=True)
+            
+            return True, "Success"
+            
+    except Exception as e:
+        return False, str(e)
 
-def atomic_replace(src_tmp: Path, dst: Path):
-    # Os.replace = atomic rename di mayoritas OS
-    os.replace(src_tmp, dst)
-
-# --- SR core ---
-def load_model(device, model_name: str, scale_native: int):
-    """
-    model_name: 'general-x4v3' | 'x4plus' | 'x2plus'
-    scale_native: 4 untuk x4, 2 untuk x2
-    """
-    model = RealESRGAN(device, scale=scale_native)
-    weight_map = {
-        "general-x4v3": "realesr-general-x4v3.pth",
-        "x4plus": "RealESRGAN_x4plus.pth",
-        "x2plus": "RealESRGAN_x2plus.pth",
-    }
-    weights = weight_map[model_name]
-    if not Path(weights).exists():
-        raise FileNotFoundError(
-            f"Bobot '{weights}' tidak ditemukan. Letakkan file bobot di folder skrip."
-        )
-    model.load_weights(weights)
-    return model
-
-def enhance_with_scale(model, img: Image.Image, out_scale: int, native_scale: int):
-    """
-    Jalankan enhance dengan model native (2× atau 4×), lalu resize ke target 1/2/3×.
-    out_scale: 1 | 2 | 3
-    native_scale: 2 | 4
-    """
-    # Safety: untuk 1× kita tetap enhance agar noise/tekstur diperbaiki, lalu kembalikan ke ukuran asli
-    # Strategi: enhance sekali ke native_scale, lalu down/up ke target out_scale menggunakan Lanczos.
-    w, h = img.width, img.height
-    # Upscale ke native
-    img_sr = model.predict(img)  # hasil w*native_scale, h*native_scale
-
-    # Hitung target size
-    target_w = int(round(w * out_scale))
-    target_h = int(round(h * out_scale))
-
-    if img_sr.width == target_w and img_sr.height == target_h:
-        return img_sr
-
-    # Resize ke target menggunakan Lanczos (tajam & aman untuk downsample)
-    img_out = img_sr.resize((target_w, target_h), Image.LANCZOS)
-    return img_out
-
-def process_one(
-    path: Path,
-    model,
-    target_scale: int,
-    native_scale: int,
-    jpeg_quality: int = 92,
-    keep_metadata: bool = False,
-):
-    img = Image.open(path)
-    img = ensure_rgb(img)
-
-    out_img = enhance_with_scale(model, img, target_scale, native_scale)
-
-    # Simpan atomically
-    suffix = path.suffix.lower()
-    with tempfile.NamedTemporaryFile(delete=False, dir=str(path.parent), suffix=suffix) as tmp:
-        tmp_path = Path(tmp.name)
-    save_kwargs = {}
-    if suffix in (".jpg", ".jpeg"):
-        save_kwargs["quality"] = jpeg_quality
-        save_kwargs["optimize"] = True
-        save_kwargs["progressive"] = True
-    if not keep_metadata:
-        out_img.info.clear()
-    out_img.save(tmp_path, **save_kwargs)
-    atomic_replace(tmp_path, path)
+def upscale_image_sips(input_path: Path, output_path: Path, scale: int):
+    """Use macOS built-in sips command for upscaling (high quality)"""
+    try:
+        import subprocess
+        
+        # Get original dimensions
+        with Image.open(input_path) as img:
+            width, height = img.size
+        
+        new_width = width * scale
+        new_height = height * scale
+        
+        # Ensure output directory exists
+        output_path.parent.mkdir(parents=True, exist_ok=True)
+        
+        cmd = [
+            "sips",
+            "-z", str(new_height), str(new_width),
+            str(input_path),
+            "--out", str(output_path)
+        ]
+        
+        result = subprocess.run(cmd, capture_output=True, text=True)
+        
+        if result.returncode == 0:
+            return True, "Success"
+        else:
+            return False, result.stderr
+            
+    except Exception as e:
+        return False, str(e)
 
 def main():
-    ap = argparse.ArgumentParser(
-        description="Batch upscale Real-ESRGAN (1x/2x/3x) dengan replace in-place."
-    )
-    ap.add_argument("input_dir", type=str, help="Folder berisi gambar")
-    ap.add_argument(
-        "--scale",
-        type=int,
-        default=2,
-        choices=[1, 2, 3],
-        help="Skala output: 1 (enhance saja), 2, atau 3",
-    )
-    ap.add_argument(
-        "--model",
-        type=str,
-        default="general-x4v3",
-        choices=["general-x4v3", "x4plus", "x2plus"],
-        help="Pilih bobot model",
-    )
-    ap.add_argument(
-        "--tile",
-        type=int,
-        default=0,
-        help="Ukuran tile (0=auto by library; kecilkan jika RAM/GPU mepet, mis. 200~400)",
-    )
-    ap.add_argument(
-        "--fp16",
-        action="store_true",
-        help="Gunakan half precision (hemat VRAM; butuh GPU yang mendukung)",
-    )
-    ap.add_argument(
-        "--jpeg-quality",
-        type=int,
-        default=92,
-        help="Kualitas JPEG saat overwrite (jpg/jpeg saja)",
-    )
-    ap.add_argument(
-        "--cpu",
-        action="store_true",
-        help="Paksa pakai CPU meski ada GPU",
-    )
-    ap.add_argument(
-        "--keep-metadata",
-        action="store_true",
-        help="Pertahankan metadata/EXIF (default: dibuang untuk kompatibilitas platform stok)",
-    )
-
-    args = ap.parse_args()
-    root = Path(args.input_dir)
-    if not root.exists():
-        print(f"Folder '{root}' tidak ditemukan.", file=sys.stderr)
+    parser = argparse.ArgumentParser(description="Simple Image Upscaler")
+    parser.add_argument("input_dir", help="Input directory containing images")
+    parser.add_argument("--scale", type=int, default=2, choices=[2, 3, 4], help="Scale factor")
+    parser.add_argument("--method", default="lanczos", 
+                       choices=["lanczos", "bicubic", "sips"], help="Upscaling method")
+    parser.add_argument("--output", help="Output directory (default: input_dir/upscaled)")
+    parser.add_argument("--replace", action="store_true", help="Replace original files")
+    parser.add_argument("--no-suffix", action="store_true", help="Don't add _x{scale} suffix")
+    parser.add_argument("--verbose", "-v", action="store_true", help="Verbose output")
+    parser.add_argument("--test-one", action="store_true", help="Test with one image first")
+    
+    args = parser.parse_args()
+    
+    input_dir = Path(args.input_dir)
+    
+    if not input_dir.exists():
+        print(f"❌ Error: Input directory '{input_dir}' not found")
         sys.exit(1)
-
-    # Tentukan device
-    if args.cpu:
-        device = torch.device("cpu")
+    
+    # Set output directory
+    if args.replace:
+        output_dir = input_dir
+        print("🔄 Replace mode: Original files will be overwritten")
+    elif args.output:
+        output_dir = Path(args.output)
     else:
-        device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-
-    # Tentukan native scale dari model
-    native_scale = 4 if args.model in ("general-x4v3", "x4plus") else 2
-
-    # Load model
-    model = load_model(device, args.model, native_scale)
-
-    # Atur tiling & precision jika tersedia (opsi wrapper)
-    # Catatan: wrapper RealESRGAN ini otomatis tiling; sebagian parameter internal tidak exposed.
-    # Gunakan --tile untuk menekan penggunaan memori via chunking internal jika tersedia.
-    if hasattr(model, "tile"):
-        model.tile = args.tile if args.tile and args.tile > 0 else 0
-    if args.fp16 and device.type == "cuda" and hasattr(model, "model"):
-        model.model.half()
-
-    files = list(list_images(root))
-    if not files:
-        print("Tidak ada gambar yang ditemukan.")
-        return
-
-    print(f"Device      : {device}")
-    print(f"Model       : {args.model} (native x{native_scale})")
-    print(f"Target scale: {args.scale}x")
-    print(f"Tile        : {args.tile}")
-    print(f"FP16        : {args.fp16}")
-    print(f"Files       : {len(files)}")
-
-    for p in tqdm(files, desc="Upscaling", unit="img"):
+        output_dir = input_dir / "upscaled"
+    
+    if not args.replace:
+        output_dir.mkdir(exist_ok=True)
+    
+    # Find all images
+    images = list(list_images(input_dir))
+    
+    if not images:
+        print(f"❌ No images found in {input_dir}")
+        print(f"Supported formats: {', '.join(VALID_EXT)}")
+        sys.exit(1)
+    
+    print(f"📁 Found {len(images)} images to process")
+    print(f"📂 Output directory: {output_dir}")
+    print(f"🔢 Scale factor: {args.scale}x")
+    print(f"🎨 Method: {args.method}")
+    
+    if args.test_one:
+        print("\n🧪 Test mode: Processing only the first image...")
+        images = images[:1]
+    
+    if args.replace and not args.test_one:
+        print("\n⚠️  WARNING: This will replace your original files!")
+        response = input("Continue? (y/N): ")
+        if response.lower() != 'y':
+            print("Cancelled.")
+            sys.exit(0)
+    
+    success_count = 0
+    failed_files = []
+    
+    for img_path in tqdm(images, desc="Processing images"):
         try:
-            process_one(
-                p,
-                model=model,
-                target_scale=args.scale,
-                native_scale=native_scale,
-                jpeg_quality=args.jpeg_quality,
-                keep_metadata=args.keep_metadata,
-            )
+            if args.replace:
+                # Create temporary file first
+                temp_path = img_path.parent / f"temp_upscaled_{img_path.name}"
+                
+                if args.method == "sips":
+                    success, message = upscale_image_sips(img_path, temp_path, args.scale)
+                else:
+                    success, message = upscale_image_pil(img_path, temp_path, args.scale, args.method)
+                
+                if success:
+                    # Replace original
+                    img_path.unlink()
+                    temp_path.rename(img_path)
+                    success_count += 1
+                    if args.verbose:
+                        print(f"✅ {img_path.name}")
+                else:
+                    if temp_path.exists():
+                        temp_path.unlink()
+                    failed_files.append((img_path.name, message))
+                    if args.verbose:
+                        print(f"❌ {img_path.name}: {message}")
+            else:
+                # Create new file
+                if args.no_suffix:
+                    output_path = output_dir / img_path.name
+                else:
+                    output_path = output_dir / f"{img_path.stem}_x{args.scale}{img_path.suffix}"
+                
+                if args.method == "sips":
+                    success, message = upscale_image_sips(img_path, output_path, args.scale)
+                else:
+                    success, message = upscale_image_pil(img_path, output_path, args.scale, args.method)
+                
+                if success:
+                    success_count += 1
+                    if args.verbose:
+                        print(f"✅ {img_path.name} -> {output_path.name}")
+                else:
+                    failed_files.append((img_path.name, message))
+                    if args.verbose:
+                        print(f"❌ {img_path.name}: {message}")
+                    
         except Exception as e:
-            print(f"[SKIP] {p.name} error: {e}")
-
-    print("Selesai ✅")
+            failed_files.append((img_path.name, str(e)))
+            if args.verbose:
+                print(f"❌ Error: {img_path.name}: {e}")
+    
+    print(f"\n🎉 Completed! {success_count}/{len(images)} images processed successfully")
+    
+    if failed_files:
+        print(f"\n❌ Failed files ({len(failed_files)}):")
+        for filename, error in failed_files[:5]:
+            print(f"  • {filename}: {error}")
+        if len(failed_files) > 5:
+            print(f"  ... and {len(failed_files) - 5} more")
+    
+    if not args.replace and success_count > 0:
+        print(f"\n📁 Upscaled images saved to: {output_dir}")
+    
+    if args.test_one and success_count > 0:
+        print("\n✅ Test successful! Run without --test-one to process all images.")
 
 if __name__ == "__main__":
     main()
